@@ -1,0 +1,62 @@
+# ============================================================
+# MangaUpscaler .gitignore
+# ============================================================
+
+# ---------- Python 字节码 / 缓存 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ---------- 打包 / 分发产物（PyInstaller、setuptools）----------
+build/
+dist/
+*.egg-info/
+*.egg
+*.manifest
+warn-*.txt
+
+# ---------- 运行时生成目录 ----------
+temp/
+output/
+logs/
+*.log
+
+# ---------- 本地用户配置（开发环境根目录，打包后写 %LOCALAPPDATA%）----------
+/config.json
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- 系统 / 环境文件 ----------
+.DS_Store
+Thumbs.db
+.env
+*.local
+
+# ---------- waifu2x-ncnn-vulkan 第三方工具 ----------
+# 以下 exe / dll / 模型文件体积较大（合计约 40MB），且可从官方仓库重新下载，
+# 不提交到源码仓库；打包进 exe 的内容由 MangaUpscaler.spec 的 datas 负责，
+# Release 附件已完整包含，源码仓库无需重复存放。
+# LICENSE / README.md 会保留提交（MIT 许可证合规要求）。
+# 开发者克隆后请自行下载并解压到 tools/waifu2x-ncnn-vulkan/ 目录：
+#   https://github.com/nihui/waifu2x-ncnn-vulkan/releases
+tools/waifu2x-ncnn-vulkan/*.exe
+tools/waifu2x-ncnn-vulkan/*.dll
+tools/waifu2x-ncnn-vulkan/models-*/
