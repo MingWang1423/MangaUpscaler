@@ -37,7 +37,7 @@ An EPUB manga upscaler powered by waifu2x-ncnn-vulkan.
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/MingWang/MangaUpscaler.git
+git clone https://github.com/MingWang1423/MangaUpscaler.git
 cd MangaUpscaler
 
 # 2. 创建虚拟环境
