@@ -43,7 +43,7 @@ An EPUB manga upscaler powered by waifu2x-ncnn-vulkan.
 ## 📥 下载与使用
 
 1. 前往 [Releases](https://github.com/MingWang1423/MangaUpscaler/releases/latest) 页面
-2. 下载最新的 `MangaUpscaler_vX.X.X_win64.rar`
+2. 下载最新的 `MangaUpscaler_vX.X.X_win64.zip`
 3. 解压到任意目录（不要放在中文路径下）
 4. 双击 `MangaUpscaler.exe` 运行
 5. 点击「选择 EPUB」，选一本漫画即可自动处理
