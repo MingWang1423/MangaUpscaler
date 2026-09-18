@@ -60,3 +60,6 @@ Thumbs.db
 tools/waifu2x-ncnn-vulkan/*.exe
 tools/waifu2x-ncnn-vulkan/*.dll
 tools/waifu2x-ncnn-vulkan/models-*/
+
+# ---------- 发布产物（约 84MB，作为 GitHub Release 附件上传，不入库）----------
+MangaUpscaler_v*.zip
