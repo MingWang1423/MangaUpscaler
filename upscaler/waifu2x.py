@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from PIL import Image
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 # Windows 下隐藏 waifu2x 子进程的控制台黑窗；非 Windows 平台该值无用（不传该参数）
@@ -74,8 +76,27 @@ def iter_images(root):
     return sorted(relatives, key=lambda rel: rel.as_posix())
 
 
+def _read_image_size(path):
+    """读取图片宽高 (宽, 高)；Pillow 懒加载，只解析头部不解码整张图。
+
+    损坏或不支持的文件返回 None，调用方据此决定不跳过、交给超分阶段处理。
+    """
+    try:
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _exceeds_bounds(size, bounds):
+    """判断图片尺寸是否放不进边界框：任一边超出即返回 True。"""
+    w, h = size
+    max_w, max_h = bounds
+    return w > max_w or h > max_h
+
+
 def upscale_folder(input_dir, output_dir, scale=2, noise=3, progress_callback=None,
-                   clean=True, cancel_check=None):
+                   clean=True, cancel_check=None, skip_if_larger_than=None):
     """递归批量放大目录内所有图片，在 output_dir 下生成完全相同的目录结构。
 
     clean=True 时先清空 output_dir，保证它精确镜像 input_dir（不混入上一次
@@ -86,7 +107,9 @@ def upscale_folder(input_dir, output_dir, scale=2, noise=3, progress_callback=No
     图片开始处理前检查一次，被取消时抛 InterruptedError（子进程已启动的那张
     会跑完，属于协作式取消的正常边界）。默认 None 时完全不检查，行为与不加
     该参数时一模一样。
-    返回 (成功数, 失败数)。
+    skip_if_larger_than=(max_w, max_h) 可选：原图任一边超出边界框时跳过超分，
+    直接复制原图（字节级一致）；None（默认）表示所有图都走超分。
+    返回 (超分成功数, 失败数, 跳过数)。
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -100,7 +123,7 @@ def upscale_folder(input_dir, output_dir, scale=2, noise=3, progress_callback=No
     if progress_callback:
         progress_callback(0, total)
 
-    success, failed = 0, 0
+    success, failed, skipped = 0, 0, 0
     for idx, rel in enumerate(images, start=1):
         if cancel_check and cancel_check():
             raise InterruptedError("用户已取消")
@@ -108,13 +131,28 @@ def upscale_folder(input_dir, output_dir, scale=2, noise=3, progress_callback=No
         target = output_path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         print(f"[{idx}/{total}] 处理: {rel.as_posix()}")
-        if upscale_image(source, target, scale=scale, noise=noise):
+
+        size = None
+        should_skip = False
+        if skip_if_larger_than is not None:
+            size = _read_image_size(source)
+            if size is not None and _exceeds_bounds(size, skip_if_larger_than):
+                should_skip = True
+
+        if should_skip:
+            shutil.copy2(source, target)
+            w, h = size
+            max_w, max_h = skip_if_larger_than
+            print(f"[skip] {rel.as_posix()} ({w}x{h}) 超出边界框 ({max_w}x{max_h})，跳过超分")
+            skipped += 1
+        elif upscale_image(source, target, scale=scale, noise=noise):
             success += 1
         else:
             failed += 1
+
         if progress_callback:
             progress_callback(idx, total)
 
-    print(f"放大完成: 成功 {success} 张，失败 {failed} 张")
-    return success, failed
+    print(f"放大完成: 超分 {success} 张，跳过 {skipped} 张，失败 {failed} 张")
+    return success, failed, skipped
 

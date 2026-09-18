@@ -6,7 +6,7 @@
 ## 技术栈
 - Python 3.11+
 - GUI：PySide6
-- 放大：waifu2x-ncnn-py（基于 waifu2x-ncnn-vulkan，NVIDIA GPU）
+- 放大：waifu2x-ncnn-vulkan.exe（subprocess 调用）
 - 打包：后续用 PyInstaller
 
 ## 第一阶段：只建 5 个文件
@@ -31,10 +31,15 @@ MangaUpscaler/
 第8步：PyInstaller 打包
 
 ## 当前阶段
-现在只做第1步和第2步：
-- 实现 main.py 入口
-- 实现 gui/main_window.py 主窗口
-- 窗口能启动，有一个按钮，点击后打印测试信息
+- v1.0.0 已发布
+- v1.1.0 开发中（画质档位功能）
+
+## v1.1.0 改动清单
+- 新增 Pillow 依赖
+- 新增画质档位配置（original / 4k / 2k）
+- 新增 upscaler/compressor.py 压缩模块
+- 新增智能跳过超分（skip_if_larger_than）
+- 新增 5 阶段流水线（提取 → 放大 → 压缩 → 打包 → 清理）
 
 ## 约束
 - 不要创建 _internal、temp、output、logs、waifu2x.exe 等文件

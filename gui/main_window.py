@@ -11,12 +11,21 @@ from PySide6.QtWidgets import (
 
 from epub.builder import build_epub
 from epub.reader import extract_images
+from upscaler.compressor import compress_folder, QUALITY_PROFILES
 from upscaler.waifu2x import upscale_folder
 
 # 配置默认值与可选范围（设置界面与流水线共用）
-DEFAULT_CONFIG = {"scale": 2, "noise": 3}
+DEFAULT_CONFIG = {"scale": 2, "noise": 3, "quality": "4k"}
 SCALE_OPTIONS = (2, 4)
 NOISE_OPTIONS = (-1, 0, 1, 2, 3)
+# 从 QUALITY_PROFILES 派生边界框（框值只定义在 compressor.py 一处，避免重复维护）
+QUALITY_BOUNDS = {key: profile["box"] for key, profile in QUALITY_PROFILES.items()}
+# 画质档位 -> 界面显示文案（仅 UI 用，不影响逻辑）
+QUALITY_LABELS = {
+    "original": "原画质（不压缩）",
+    "4k": "4K（2160×3840）",
+    "2k": "2.5K（1600×2560）",
+}
 
 
 class PipelineWorker(QThread):
@@ -34,12 +43,14 @@ class PipelineWorker(QThread):
 
     EXTRACTED_DIR = "temp/extracted"
     UPSCALED_DIR = "temp/upscaled"
+    COMPRESSED_DIR = "temp/compressed"
 
-    def __init__(self, epub_path, scale=2, noise=3, output_dir=None, parent=None):
+    def __init__(self, epub_path, scale=2, noise=3, quality="4k", output_dir=None, parent=None):
         super().__init__(parent)
         self._epub_path = epub_path
         self._scale = scale
         self._noise = noise
+        self._quality = quality
         self._output_dir = output_dir
         self._is_cancelled = False
 
@@ -70,36 +81,54 @@ class PipelineWorker(QThread):
 
             # 阶段2：放大图片
             self._check_cancelled()
-            print(f"放大参数: scale={self._scale}, noise={self._noise}")
-            success, failed_count = upscale_folder(
+            print(f"放大参数: scale={self._scale}, noise={self._noise}, quality={self._quality}")
+            success, failed_count, skipped = upscale_folder(
                 self.EXTRACTED_DIR,
                 self.UPSCALED_DIR,
                 scale=self._scale,
                 noise=self._noise,
+                skip_if_larger_than=QUALITY_BOUNDS.get(self._quality, None),
                 progress_callback=self._on_upscale_progress,
                 cancel_check=lambda: self._is_cancelled,
             )
             if failed_count > 0:
                 raise RuntimeError(
-                    f"放大失败 {failed_count} 张图片（共 {success + failed_count} 张）"
+                    f"放大失败 {failed_count} 张（成功 {success} 张，跳过 {skipped} 张，"
+                    f"共 {success + failed_count + skipped} 张）"
                 )
 
-            # 阶段3：打包 EPUB
+            # 阶段3：压缩图片
+            self._check_cancelled()
+            print(f"压缩参数: quality={self._quality}")
+            compressed_ok, compressed_failed = compress_folder(
+                self.UPSCALED_DIR,
+                self.COMPRESSED_DIR,
+                quality=self._quality,
+                progress_callback=self._on_compress_progress,
+                cancel_check=lambda: self._is_cancelled,
+            )
+            if compressed_failed > 0:
+                raise RuntimeError(
+                    f"压缩失败 {compressed_failed} 张（共 {compressed_ok + compressed_failed} 张）"
+                )
+
+            # 阶段4：打包 EPUB
             self._check_cancelled()
             os.makedirs(output_dir, exist_ok=True)   # 双保险（build_epub 内部也会建父目录）
             output_path = build_epub(
                 self._epub_path,
-                self.UPSCALED_DIR,
+                self.COMPRESSED_DIR,
                 output_epub_path=os.path.join(output_dir, output_filename),
                 progress_callback=self._on_build_progress,
                 cancel_check=lambda: self._is_cancelled,
             )
 
-            # 阶段4：清理临时文件（只有全部成功才会走到这里）
+            # 阶段5：清理临时文件（只有全部成功才会走到这里）
             self._check_cancelled()
             self.progress.emit("正在清理临时文件...", 0, 0)
             shutil.rmtree(self.EXTRACTED_DIR, ignore_errors=True)
             shutil.rmtree(self.UPSCALED_DIR, ignore_errors=True)
+            shutil.rmtree(self.COMPRESSED_DIR, ignore_errors=True)
         except InterruptedError:
             self._discard_pending_output(pending_output, output_existed)
             self.cancelled.emit()
@@ -131,9 +160,12 @@ class PipelineWorker(QThread):
     def _on_build_progress(self, done: int, total: int) -> None:
         self.progress.emit(f"正在打包：{done}/{total} 张", done, total)
 
+    def _on_compress_progress(self, done: int, total: int) -> None:
+        self.progress.emit(f"正在压缩图片：{done}/{total} 张", done, total)
+
 
 class SettingsDialog(QDialog):
-    """放大倍数与降噪等级的设置对话框。
+    """放大倍数、降噪等级与画质档位的设置对话框。
 
     只负责收集用户选择，不碰文件：落盘由 MainWindow 通过注入的 save_config
     回调完成，避免 gui 层反向依赖入口模块（main.py 运行时模块名是 __main__）。
@@ -151,12 +183,18 @@ class SettingsDialog(QDialog):
         for noise in NOISE_OPTIONS:
             self.noise_combo.addItem(str(noise), noise)
 
+        self.quality_combo = QComboBox()
+        for key, label in QUALITY_LABELS.items():
+            self.quality_combo.addItem(label, key)
+
         self._select_by_data(self.scale_combo, config.get("scale"))
         self._select_by_data(self.noise_combo, config.get("noise"))
+        self._select_by_data(self.quality_combo, config.get("quality"))
 
         form = QFormLayout()
         form.addRow("放大倍数", self.scale_combo)
         form.addRow("降噪等级", self.noise_combo)
+        form.addRow("画质档位", self.quality_combo)
 
         save_button = QPushButton("保存")
         save_button.clicked.connect(self.accept)
@@ -180,10 +218,11 @@ class SettingsDialog(QDialog):
             combo.setCurrentIndex(index)
 
     def get_config(self) -> dict:
-        """返回当前选择（itemData 里存的是 int，而不是显示文本）。"""
+        """返回当前选择（itemData 里存的是配置值，而非显示文本）。"""
         return {
             "scale": self.scale_combo.currentData(),
             "noise": self.noise_combo.currentData(),
+            "quality": self.quality_combo.currentData(),
         }
 
 
@@ -254,7 +293,7 @@ class MainWindow(QMainWindow):
         """打开设置对话框；点「保存」才更新内存配置并落盘。"""
         dialog = SettingsDialog(self.config, self)
         if dialog.exec() == QDialog.Accepted:
-            self.config = dialog.get_config()
+            self.config.update(dialog.get_config())  # 只更新 scale/noise，保留 output_dir/quality
             self._save_config(self.config)      # 落盘交给 main.py 注入的回调
             print(f"配置已保存: {self.config}")
 
@@ -298,7 +337,7 @@ class MainWindow(QMainWindow):
 
         self.pipeline_worker = PipelineWorker(
             file_path, scale=self.config["scale"], noise=self.config["noise"],
-            output_dir=output_dir,
+            quality=self.config["quality"], output_dir=output_dir,
         )
         self.pipeline_worker.progress.connect(self._on_pipeline_progress)
         self.pipeline_worker.succeeded.connect(self._on_pipeline_succeeded)

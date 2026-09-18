@@ -16,7 +16,10 @@ from gui.main_window import MainWindow
 
 APP_NAME = "MangaUpscaler"
 CONFIG_FILENAME = "config.json"
-DEFAULT_CONFIG = {"scale": 2, "noise": 3}
+DEFAULT_CONFIG = {"scale": 2, "noise": 3, "quality": "4k"}
+# 画质档位可选值（load_config 校验用）；旧值 balanced/small 映射到新档位
+QUALITY_OPTIONS = ("original", "4k", "2k")
+LEGACY_QUALITY_MAP = {"balanced": "4k", "small": "2k"}
 
 
 def get_config_path() -> Path:
@@ -55,8 +58,9 @@ def load_config(path=None) -> dict:
     """读取 config.json；文件缺失、损坏或字段非法时静默回退默认值，绝不抛异常。
 
     output_dir 字段永远返回有效字符串：文件里没有、为空串、或类型不对时，
-    一律回退到 get_default_output_dir()。旧版配置（只有 scale/noise、缺
-    output_dir）会在读取时自动补全并写回，防止后续 os.path.join 拿到空串。
+    一律回退到 get_default_output_dir()。quality 字段只接受 QUALITY_OPTIONS 中
+    的档位，旧值 balanced/small 映射到 4k/2k。旧版配置（缺 output_dir / quality）
+    会在读取时自动补全并写回，防止后续拿到空串或未定义的画质档位。
     """
     config_path = Path(path) if path else get_config_path()
     config = dict(DEFAULT_CONFIG)
@@ -69,8 +73,12 @@ def load_config(path=None) -> dict:
         return config
 
     if isinstance(data, dict):
-        # 只认这一对已知键，且必须是 int（bool 是 int 的子类，显式排除）
-        for key in DEFAULT_CONFIG:
+        # 只处理 DEFAULT_CONFIG 里默认值为 int 的字段（scale/noise），且必须是 int
+        # （bool 是 int 的子类，显式排除）；quality 是字符串，由下方单独分支处理，
+        # 避免 int 类型的错值（如 quality=99）污染默认档位
+        for key, default in DEFAULT_CONFIG.items():
+            if not isinstance(default, int):
+                continue
             value = data.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
                 config[key] = value
@@ -80,6 +88,15 @@ def load_config(path=None) -> dict:
         if isinstance(out_dir, str) and out_dir.strip():
             config["output_dir"] = out_dir
         elif "output_dir" not in data:
+            save_config(config, config_path)
+
+        # quality：有效档位才采用；旧值 balanced/small 映射到 4k/2k；字段缺失补默认并写回
+        quality = data.get("quality")
+        if isinstance(quality, str) and quality.strip():
+            quality = LEGACY_QUALITY_MAP.get(quality, quality)
+            if quality in QUALITY_OPTIONS:
+                config["quality"] = quality
+        elif "quality" not in data:
             save_config(config, config_path)
     return config
 
