@@ -3,10 +3,12 @@ import shutil
 import zipfile
 from pathlib import Path, PurePosixPath
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-DEFAULT_OUTPUT_DIR = "temp/extracted"
+from epub.formats import is_image_name
+from logging_setup import get_logger
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+
+logger = get_logger("epub.reader")
 
 
 def normalize_arcname(arcname):
@@ -15,8 +17,8 @@ def normalize_arcname(arcname):
 
 
 def is_image_arcname(arcname):
-    """按扩展名判断 ZIP 条目名是不是图片。"""
-    return PurePosixPath(normalize_arcname(arcname)).suffix.lower() in IMAGE_EXTS
+    """按扩展名判断 ZIP 条目名是不是图片（判定规则集中在 epub/formats.py）。"""
+    return is_image_name(arcname)
 
 
 def arcname_to_parts(arcname):
@@ -111,14 +113,15 @@ def inspect_epub(file_path):
     }
 
 
-def extract_images(file_path, output_dir=DEFAULT_OUTPUT_DIR, clean=True):
+def extract_images(file_path, output_dir, clean=True):
     """提取 EPUB 内所有图片到 output_dir，完整保留 EPUB 内部的相对目录结构。
 
     例如 EPUB 内的 OEBPS/Images/cover.jpg 会提取到
     <output_dir>/OEBPS/Images/cover.jpg，因此不同章节目录下的同名图片
     （ch1/page01.jpg 与 ch2/page01.jpg）不会互相覆盖。
-    clean=True 时先清空 output_dir（它是可随时重建的工作目录），避免上一次
-    提取的残留文件混进后续放大与打包流程。
+    output_dir 应为调用方为本次任务创建的独立工作目录；clean=True 时先清空
+    output_dir（仅用于调用方自己的可重建工作目录），避免上一次提取的残留文件
+    混进后续放大与打包流程。
     返回提取出的图片完整路径列表。
     """
     path = Path(file_path)
@@ -137,15 +140,15 @@ def extract_images(file_path, output_dir=DEFAULT_OUTPUT_DIR, clean=True):
         for name in image_names:
             rel = local_names.get(name)
             if rel is None:
-                print(f"跳过不安全条目: {name}")
+                logger.warning("跳过不安全条目: %s", name)
                 skipped += 1
                 continue
             target = output_path.joinpath(*rel.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(name))
             extracted.append(str(target))
-            print(f"已提取: {name} -> {target}")
+            logger.debug("已提取: %s -> %s", name, target)
 
-    print(f"提取完成: {len(extracted)} 张图片，跳过 {skipped} 个不安全条目")
+    logger.info("提取完成: %d 张图片，跳过 %d 个不安全条目", len(extracted), skipped)
     return extracted
 

@@ -41,14 +41,14 @@ class CompressFolderTest(unittest.TestCase):
         self._make_jpeg("big.jpg", 5000, 3000)
         self.assertEqual(self._run("4k"), (1, 0))
         with Image.open(self.output_dir / "big.jpg") as im:
-            self.assertEqual(im.size, (2160, 1296))
+            self.assertEqual(im.size, (3600, 2160))   # 横版双页：宽不再被压到 2160
             self.assertEqual(im.format, "JPEG")      # 仍是 JPEG，非 PNG 伪装
 
     def test_large_jpeg_2k_resized(self):
         self._make_jpeg("big.jpg", 5000, 3000)
         self.assertEqual(self._run("2k"), (1, 0))
         with Image.open(self.output_dir / "big.jpg") as im:
-            self.assertEqual(im.size, (1600, 960))
+            self.assertEqual(im.size, (2560, 1536))   # 横版双页按 2560×1600 自适应
             self.assertEqual(im.format, "JPEG")
 
     def test_small_jpeg_4k_unchanged(self):
@@ -68,7 +68,7 @@ class CompressFolderTest(unittest.TestCase):
         with Image.open(self.output_dir / "trans.png") as out:
             self.assertEqual(out.format, "PNG")      # 仍是 PNG
             self.assertEqual(out.mode, "RGBA")       # 仍有 alpha 通道
-            self.assertEqual(out.size, (2160, 1296))  # 缩放正确
+            self.assertEqual(out.size, (3600, 2160))  # 横版：宽不再被压到 2160
             self.assertEqual(out.getchannel("A").getextrema(), (0, 255))  # 透明不丢
 
     def test_original_copies_bytes(self):

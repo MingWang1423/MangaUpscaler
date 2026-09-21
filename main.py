@@ -1,4 +1,4 @@
-"""程序入口：读取配置、启动主窗口。
+"""程序入口：读取配置、配置日志、做启动检查、启动主窗口。
 
 配置的读写统一放在这里（load_config / save_config），再通过依赖注入交给
 MainWindow 使用：main.py 作为脚本运行时模块名是 __main__，gui 层无法
@@ -6,20 +6,23 @@ MainWindow 使用：main.py 作为脚本运行时模块名是 __main__，gui 层
 """
 
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
+from config_schema import DEFAULT_CONFIG, sanitize_config
+from diagnostics import startup_checks
 from gui.main_window import MainWindow
+from logging_setup import get_logger, setup_logging
 
 APP_NAME = "MangaUpscaler"
 CONFIG_FILENAME = "config.json"
-DEFAULT_CONFIG = {"scale": 2, "noise": 3, "quality": "4k"}
-# 画质档位可选值（load_config 校验用）；旧值 balanced/small 映射到新档位
-QUALITY_OPTIONS = ("original", "4k", "2k")
-LEGACY_QUALITY_MAP = {"balanced": "4k", "small": "2k"}
+
+logger = get_logger("main")
 
 
 def get_config_path() -> Path:
@@ -54,86 +57,92 @@ def get_default_output_dir() -> str:
     return "output"
 
 
-def load_config(path=None) -> dict:
-    """读取 config.json；文件缺失、损坏或字段非法时静默回退默认值，绝不抛异常。
-
-    output_dir 字段永远返回有效字符串：文件里没有、为空串、或类型不对时，
-    一律回退到 get_default_output_dir()。quality 字段只接受 QUALITY_OPTIONS 中
-    的档位，旧值 balanced/small 映射到 4k/2k。旧版配置（缺 output_dir / quality）
-    会在读取时自动补全并写回，防止后续拿到空串或未定义的画质档位。
-    """
-    config_path = Path(path) if path else get_config_path()
-    config = dict(DEFAULT_CONFIG)
-    config["output_dir"] = get_default_output_dir()
+def _write_config_atomic(config, config_path) -> None:
+    """临时文件 + os.replace 原子写入，避免突然断电产生半个 JSON。"""
+    config_path = Path(config_path)
+    tmp = None
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        # 文件不存在 / 无权限 / JSON 语法错误：一律按默认值继续运行
-        return config
-
-    if isinstance(data, dict):
-        # 只处理 DEFAULT_CONFIG 里默认值为 int 的字段（scale/noise），且必须是 int
-        # （bool 是 int 的子类，显式排除）；quality 是字符串，由下方单独分支处理，
-        # 避免 int 类型的错值（如 quality=99）污染默认档位
-        for key, default in DEFAULT_CONFIG.items():
-            if not isinstance(default, int):
-                continue
-            value = data.get(key)
-            if isinstance(value, int) and not isinstance(value, bool):
-                config[key] = value
-
-        # output_dir：有效非空字符串才采用，否则回退默认；字段缺失视为旧配置迁移
-        out_dir = data.get("output_dir")
-        if isinstance(out_dir, str) and out_dir.strip():
-            config["output_dir"] = out_dir
-        elif "output_dir" not in data:
-            save_config(config, config_path)
-
-        # quality：有效档位才采用；旧值 balanced/small 映射到 4k/2k；字段缺失补默认并写回
-        quality = data.get("quality")
-        if isinstance(quality, str) and quality.strip():
-            quality = LEGACY_QUALITY_MAP.get(quality, quality)
-            if quality in QUALITY_OPTIONS:
-                config["quality"] = quality
-        elif "quality" not in data:
-            save_config(config, config_path)
-    return config
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = config_path.with_name(f"{config_path.name}.tmp-{uuid.uuid4().hex}")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, ensure_ascii=False, indent=4)
+            fh.write("\n")
+        os.replace(tmp, config_path)
+    except OSError as exc:
+        logger.warning("无法写入配置文件 %s: %s", config_path, exc)
+        if tmp is not None:
+            try:
+                Path(tmp).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def save_config(config, path=None) -> None:
-    """把配置写入 config.json；写失败只提示，不影响程序继续运行。"""
+    """把配置原子写入 config.json；写失败只记录日志，不影响程序继续运行。"""
+    _write_config_atomic(config, Path(path) if path else get_config_path())
+
+
+def load_config(path=None) -> dict:
+    """读取并严格校验 config.json；缺失/损坏/非法字段一律回退默认值，绝不抛异常。
+
+    字段非法或缺失（迁移/修复）时会原子写回修复后的配置；文件不存在时只返回
+    默认值（由 ensure_config 负责生成文件）。
+    """
     config_path = Path(path) if path else get_config_path()
+    default_output = get_default_output_dir()
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        # indent=4 便于用户手动编辑；ensure_ascii=False 保留可读性
-        with open(config_path, "w", encoding="utf-8") as fh:
-            json.dump(config, fh, ensure_ascii=False, indent=4)
-            fh.write("\n")
-    except OSError as exc:
-        print(f"警告: 无法写入配置文件 {config_path}: {exc}")
+        with open(config_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {**DEFAULT_CONFIG, "output_dir": default_output}
+    except (OSError, ValueError) as exc:
+        # JSON 损坏 / 无权限：回退默认并尝试写回修复
+        logger.warning("配置文件不可用，回退默认值: %s (%s)", config_path, exc)
+        config = {**DEFAULT_CONFIG, "output_dir": default_output}
+        _write_config_atomic(config, config_path)
+        return config
+
+    config, changed = sanitize_config(data, default_output)
+    if changed:
+        logger.info("配置文件已迁移/修复: %s", config_path)
+        _write_config_atomic(config, config_path)
+    return config
 
 
 def ensure_config(path=None) -> dict:
-    """读取配置；若 config.json 不存在则用默认值生成，保证文件一定存在。
-
-    供 main() 与测试脚本共用，避免把「首次生成」的逻辑复制多份。
-    """
+    """读取配置；若 config.json 不存在则用默认值生成，保证文件一定存在。"""
     config_path = Path(path) if path else get_config_path()
     config = load_config(config_path)
     if not config_path.exists():
-        # 首次启动：自动生成默认配置文件
         save_config(config, config_path)
-        print(f"已创建默认配置文件: {config_path}")
+        logger.info("已创建默认配置文件: %s", config_path)
     return config
+
+
+def _show_startup_warnings(config) -> None:
+    """把启动检查发现的问题汇总成一个可读对话框，给出修复建议，不崩溃。"""
+    issues = startup_checks(config)
+    if not issues:
+        return
+    lines = []
+    for issue in issues:
+        lines.append(f"• {issue['title']}")
+        for detail in issue["details"]:
+            lines.append(f"    {detail}")
+        if issue["suggestion"]:
+            lines.append(f"    建议：{issue['suggestion']}")
+    QMessageBox.warning(None, "启动检查", "\n".join(lines))
 
 
 def main() -> None:
     app = QApplication(sys.argv)
-    # AppConfigLocation 依赖 applicationName，必须在取配置路径之前设置
+    # AppConfigLocation / AppDataLocation 依赖 applicationName，必须先设置
     app.setApplicationName(APP_NAME)
 
+    setup_logging()
     config = ensure_config()
+    _show_startup_warnings(config)
+
     window = MainWindow(config, save_config_callback=save_config,
                         default_output_dir=get_default_output_dir)
     window.show()

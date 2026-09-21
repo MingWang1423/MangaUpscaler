@@ -68,14 +68,27 @@ cd MangaUpscaler
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 3. 安装依赖
+# 3. 安装运行依赖
 pip install -r requirements.txt
 
-# 4. 下载 waifu2x-ncnn-vulkan（大文件未纳入仓库）
+# 4. 安装开发依赖（含 ruff）
+pip install -r requirements-dev.txt
+
+# 5. 下载 waifu2x-ncnn-vulkan（大文件未纳入仓库）
 #    访问 https://github.com/nihui/waifu2x-ncnn-vulkan/releases
 #    下载 Windows 版压缩包，解压到 tools/waifu2x-ncnn-vulkan/
 #    确保该目录下包含 waifu2x-ncnn-vulkan.exe 和 models-cunet 等模型文件夹
 
-# 5. 运行
+# 6. 运行
 python main.py
+```
+
+## ✅ 测试与代码检查
+
+```bash
+# 代码检查
+ruff check .
+
+# 运行全部单元测试
+python -m unittest discover -s tests -p "test_*.py" -v
 ```

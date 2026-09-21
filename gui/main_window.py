@@ -1,56 +1,64 @@
-import os
-import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QVBoxLayout, QWidget,
 )
 
+from config_schema import DEFAULT_CONFIG, GPU_GUI_OPTIONS, NOISE_OPTIONS, SCALE_OPTIONS
+from diagnostics import check_waifu2x_tool
 from epub.builder import build_epub
 from epub.reader import extract_images
-from upscaler.compressor import compress_folder, QUALITY_PROFILES
+from errors import classify_error, format_details
+from logging_setup import get_logger, get_log_path
+from upscaler.compressor import compress_folder, quality_target
 from upscaler.waifu2x import upscale_folder
+from workspace import TaskWorkspace
 
-# 配置默认值与可选范围（设置界面与流水线共用）
-DEFAULT_CONFIG = {"scale": 2, "noise": 3, "quality": "4k"}
-SCALE_OPTIONS = (2, 4)
-NOISE_OPTIONS = (-1, 0, 1, 2, 3)
-# 从 QUALITY_PROFILES 派生边界框（框值只定义在 compressor.py 一处，避免重复维护）
-QUALITY_BOUNDS = {key: profile["box"] for key, profile in QUALITY_PROFILES.items()}
+logger = get_logger("gui.main_window")
+
 # 画质档位 -> 界面显示文案（仅 UI 用，不影响逻辑）
 QUALITY_LABELS = {
     "original": "原画质（不压缩）",
     "4k": "4K（2160×3840）",
     "2k": "2.5K（1600×2560）",
 }
+# GPU -> 界面显示文案
+GPU_LABELS = {
+    "auto": "自动选择（推荐）",
+    -1: "CPU",
+    0: "GPU 0",
+    1: "GPU 1",
+    2: "GPU 2",
+}
 
 
 class PipelineWorker(QThread):
-    """在子线程里顺序执行「提取图片 -> 放大图片 -> 打包 EPUB -> 清理缓存」。
+    """在子线程里顺序执行「提取图片 -> 放大图片 -> 压缩图片 -> 打包 EPUB」。
 
+    每次任务使用独立的工作目录（TaskWorkspace），成功时自动清理；失败或取消时
+    保留缓存目录供排错，并通过信号把缓存路径回传给界面。
     取消采用协作式：cancel() 只把标志位置 True，子线程在每个阶段开始前以及
     底层耗时循环的间隙检查该标志，发现被取消就主动抛 InterruptedError 退出。
     绝不使用 terminate() 之类的强制手段，避免留下写了一半的文件。
     """
 
     progress = Signal(str, int, int)  # (提示文本, 已完成, 总数)；总数 0 表示不确定
-    succeeded = Signal(str)           # 全部成功，参数为新 EPUB 的完整路径
-    cancelled = Signal()              # 用户取消
-    failed = Signal(str)              # 失败，参数为错误信息
+    succeeded = Signal(str, str)      # 全部成功，参数为 (新 EPUB 完整路径, 统计摘要)
+    cancelled = Signal(str)           # 用户取消，参数为保留的缓存目录路径（可为空）
+    failed = Signal(str, str, str)    # 失败，参数为 (友好信息, 建议, 详细信息)
 
-    EXTRACTED_DIR = "temp/extracted"
-    UPSCALED_DIR = "temp/upscaled"
-    COMPRESSED_DIR = "temp/compressed"
-
-    def __init__(self, epub_path, scale=2, noise=3, quality="4k", output_dir=None, parent=None):
+    def __init__(self, epub_path, scale=2, noise=3, quality="4k", gpu="auto",
+                 output_dir=None, parent=None):
         super().__init__(parent)
         self._epub_path = epub_path
         self._scale = scale
         self._noise = noise
         self._quality = quality
+        self._gpu = gpu
         self._output_dir = output_dir
         self._is_cancelled = False
 
@@ -65,94 +73,81 @@ class PipelineWorker(QThread):
 
     def run(self) -> None:
         """子线程入口：串联底层函数，只通过信号与主线程通信。"""
-        # 记录打包前的状态：失败/取消时清掉这次写了一半的残缺输出（只删本次新产生的）
-        output_dir = self._output_dir or "output"
-        output_filename = f"{Path(self._epub_path).stem}_upscaled.epub"
-        pending_output = Path(output_dir) / output_filename
-        output_existed = pending_output.exists()
+        workspace = None
+        cache_path = ""
+        output_path = ""
 
         try:
+            # 每次任务一个独立工作目录（extracted/upscaled/compressed），不依赖 CWD
+            workspace = TaskWorkspace()
+            cache_path = str(workspace.root)
+
             # 阶段1：提取图片
             self._check_cancelled()
             self.progress.emit("正在提取图片...", 0, 0)
-            images = extract_images(self._epub_path)
+            images = extract_images(self._epub_path, str(workspace.extracted), clean=False)
             if not images:
                 raise RuntimeError("EPUB 内没有可提取的图片")
 
             # 阶段2：放大图片
             self._check_cancelled()
-            print(f"放大参数: scale={self._scale}, noise={self._noise}, quality={self._quality}")
-            success, failed_count, skipped = upscale_folder(
-                self.EXTRACTED_DIR,
-                self.UPSCALED_DIR,
+            logger.info("放大参数: scale=%s, noise=%s, quality=%s, gpu=%s",
+                        self._scale, self._noise, self._quality, self._gpu)
+            upscaled, skipped, copied, up_failed = upscale_folder(
+                str(workspace.extracted),
+                str(workspace.upscaled),
                 scale=self._scale,
                 noise=self._noise,
-                skip_if_larger_than=QUALITY_BOUNDS.get(self._quality, None),
+                target=quality_target(self._quality),
                 progress_callback=self._on_upscale_progress,
                 cancel_check=lambda: self._is_cancelled,
+                clean=False,
+                gpu=self._gpu,
             )
-            if failed_count > 0:
-                raise RuntimeError(
-                    f"放大失败 {failed_count} 张（成功 {success} 张，跳过 {skipped} 张，"
-                    f"共 {success + failed_count + skipped} 张）"
-                )
 
             # 阶段3：压缩图片
             self._check_cancelled()
-            print(f"压缩参数: quality={self._quality}")
-            compressed_ok, compressed_failed = compress_folder(
-                self.UPSCALED_DIR,
-                self.COMPRESSED_DIR,
+            logger.info("压缩参数: quality=%s", self._quality)
+            _, compressed_failed = compress_folder(
+                str(workspace.upscaled),
+                str(workspace.compressed),
                 quality=self._quality,
                 progress_callback=self._on_compress_progress,
                 cancel_check=lambda: self._is_cancelled,
+                clean=False,
             )
-            if compressed_failed > 0:
-                raise RuntimeError(
-                    f"压缩失败 {compressed_failed} 张（共 {compressed_ok + compressed_failed} 张）"
-                )
 
-            # 阶段4：打包 EPUB
+            # 阶段4：打包 EPUB（build_epub 内部先写临时文件，成功后原子替换正式输出）
             self._check_cancelled()
-            os.makedirs(output_dir, exist_ok=True)   # 双保险（build_epub 内部也会建父目录）
+            output_dir = Path(self._output_dir) if self._output_dir else Path("output")
+            output_filename = f"{Path(self._epub_path).stem}_upscaled.epub"
             output_path = build_epub(
                 self._epub_path,
-                self.COMPRESSED_DIR,
-                output_epub_path=os.path.join(output_dir, output_filename),
+                str(workspace.compressed),
+                output_epub_path=str(output_dir / output_filename),
                 progress_callback=self._on_build_progress,
                 cancel_check=lambda: self._is_cancelled,
             )
 
-            # 阶段5：清理临时文件（只有全部成功才会走到这里）
-            self._check_cancelled()
-            self.progress.emit("正在清理临时文件...", 0, 0)
-            shutil.rmtree(self.EXTRACTED_DIR, ignore_errors=True)
-            shutil.rmtree(self.UPSCALED_DIR, ignore_errors=True)
-            shutil.rmtree(self.COMPRESSED_DIR, ignore_errors=True)
+            total_failed = up_failed + compressed_failed
+            summary = (f"超分 {upscaled} 张，跳过 {skipped} 张，"
+                       f"原样复制 {copied} 张，失败 {total_failed} 张")
         except InterruptedError:
-            self._discard_pending_output(pending_output, output_existed)
-            self.cancelled.emit()
+            self.cancelled.emit(cache_path)
             return
         except Exception as exc:  # 兜底：任何异常都要让界面恢复可用
-            self._discard_pending_output(pending_output, output_existed)
-            self.failed.emit(str(exc))
+            logger.exception("流水线失败")
+            _, title, message, suggestion = classify_error(exc)
+            friendly = f"{title}：{message}"
+            if cache_path:
+                friendly += f"\n临时缓存已保留：{cache_path}"
+            self.failed.emit(friendly, suggestion, format_details(exc))
             return
 
-        self.succeeded.emit(output_path)
-
-    @staticmethod
-    def _discard_pending_output(pending_output, output_existed) -> None:
-        """删除本次流水线写了一半的输出 EPUB（打包阶段才会生成）。
-
-        只删"本次新产生"的文件：打包前就已存在的产物（上一次成功的结果）不动。
-        失败或取消时保留 temp 目录以便排查，但没有必要留下残缺的成品。
-        """
-        if output_existed or not pending_output.exists():
-            return
-        try:
-            pending_output.unlink()
-        except OSError as exc:
-            print(f"警告: 无法删除未完成的输出文件 {pending_output}: {exc}")
+        # 成功：清理本次任务的工作目录（最终 EPUB 在输出目录，不受影响）
+        if workspace is not None:
+            workspace.cleanup()
+        self.succeeded.emit(output_path, summary)
 
     def _on_upscale_progress(self, done: int, total: int) -> None:
         self.progress.emit(f"正在放大：{done}/{total} 张", done, total)
@@ -187,14 +182,20 @@ class SettingsDialog(QDialog):
         for key, label in QUALITY_LABELS.items():
             self.quality_combo.addItem(label, key)
 
+        self.gpu_combo = QComboBox()
+        for gpu in GPU_GUI_OPTIONS:
+            self.gpu_combo.addItem(GPU_LABELS.get(gpu, str(gpu)), gpu)
+
         self._select_by_data(self.scale_combo, config.get("scale"))
         self._select_by_data(self.noise_combo, config.get("noise"))
         self._select_by_data(self.quality_combo, config.get("quality"))
+        self._select_by_data(self.gpu_combo, config.get("gpu"))
 
         form = QFormLayout()
         form.addRow("放大倍数", self.scale_combo)
         form.addRow("降噪等级", self.noise_combo)
         form.addRow("画质档位", self.quality_combo)
+        form.addRow("GPU", self.gpu_combo)
 
         save_button = QPushButton("保存")
         save_button.clicked.connect(self.accept)
@@ -223,6 +224,7 @@ class SettingsDialog(QDialog):
             "scale": self.scale_combo.currentData(),
             "noise": self.noise_combo.currentData(),
             "quality": self.quality_combo.currentData(),
+            "gpu": self.gpu_combo.currentData(),
         }
 
 
@@ -293,9 +295,9 @@ class MainWindow(QMainWindow):
         """打开设置对话框；点「保存」才更新内存配置并落盘。"""
         dialog = SettingsDialog(self.config, self)
         if dialog.exec() == QDialog.Accepted:
-            self.config.update(dialog.get_config())  # 只更新 scale/noise，保留 output_dir/quality
+            self.config.update(dialog.get_config())  # 更新 scale/noise/quality/gpu
             self._save_config(self.config)      # 落盘交给 main.py 注入的回调
-            print(f"配置已保存: {self.config}")
+            logger.info("配置已保存: %s", self.config)
 
     def _on_browse_output_dir(self) -> None:
         """浏览选择输出目录：更新输入框并立即落盘。"""
@@ -307,11 +309,25 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setText(chosen)
         self.config["output_dir"] = chosen
         self._save_config(self.config)
-        print(f"输出目录已设置: {chosen}")
+        logger.info("输出目录已设置: %s", chosen)
+
+    def _check_can_process(self) -> bool:
+        """开始处理前检查核心 waifu2x 组件；缺失时阻止任务并给出一次清晰提示。"""
+        missing = check_waifu2x_tool()
+        if not missing:
+            return True
+        QMessageBox.critical(
+            self, "无法开始处理",
+            "缺少 waifu2x 组件，暂时无法处理：\n" + "\n".join(missing)
+            + "\n\n请下载完整包，或将 waifu2x-ncnn-vulkan 放到 tools/waifu2x-ncnn-vulkan/。"
+        )
+        return False
 
     def _on_select_epub(self) -> None:
         """选好文件后立即启动流水线，无需再点第二次。"""
         if self.pipeline_worker is not None and self.pipeline_worker.isRunning():
+            return
+        if not self._check_can_process():
             return
 
         file_path, _ = QFileDialog.getOpenFileName(
@@ -320,7 +336,7 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         self.selected_epub_path = file_path
-        print(f"已选择文件: {file_path}")
+        logger.info("已选择文件: %s", file_path)
 
         # 输出目录：以输入框为准，空则回退默认；手动编辑的值也一并落盘
         output_dir = self.output_dir_edit.text().strip() or self._get_default_output_dir()
@@ -337,7 +353,8 @@ class MainWindow(QMainWindow):
 
         self.pipeline_worker = PipelineWorker(
             file_path, scale=self.config["scale"], noise=self.config["noise"],
-            quality=self.config["quality"], output_dir=output_dir,
+            quality=self.config["quality"], gpu=self.config.get("gpu", "auto"),
+            output_dir=output_dir,
         )
         self.pipeline_worker.progress.connect(self._on_pipeline_progress)
         self.pipeline_worker.succeeded.connect(self._on_pipeline_succeeded)
@@ -362,19 +379,41 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)       # 不确定进度：显示忙碌动画
         self.progress_bar.setVisible(True)
 
-    def _on_pipeline_succeeded(self, output_path: str) -> None:
+    def _on_pipeline_succeeded(self, output_path: str, summary: str) -> None:
         self._finish_pipeline()
-        QMessageBox.information(self, "完成", f"新 EPUB 已生成：\n{output_path}")
-
-    def _on_pipeline_cancelled(self) -> None:
-        self._finish_pipeline()
-        QMessageBox.information(self, "提示", "处理已取消。临时文件已保留在 temp 目录。")
-
-    def _on_pipeline_failed(self, message: str) -> None:
-        self._finish_pipeline()
-        QMessageBox.critical(
-            self, "错误", f"处理失败：{message}\n临时文件已保留在 temp 目录。"
+        QMessageBox.information(
+            self, "完成",
+            f"新 EPUB 已生成：\n{output_path}\n\n处理统计：{summary}"
         )
+
+    def _on_pipeline_cancelled(self, cache_path: str) -> None:
+        self._finish_pipeline()
+        msg = "处理已取消。"
+        if cache_path:
+            msg += f"\n临时缓存已保留，可用于排错：\n{cache_path}"
+        QMessageBox.information(self, "提示", msg)
+
+    def _on_pipeline_failed(self, message: str, suggestion: str, details: str) -> None:
+        self._finish_pipeline()
+        self._show_error_dialog(message, suggestion, details)
+
+    def _show_error_dialog(self, message: str, suggestion: str, details: str) -> None:
+        """错误弹窗：正文简短易懂；提供「复制详细信息」「打开日志目录」。"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("错误")
+        box.setText(message)
+        if suggestion:
+            box.setInformativeText(suggestion)
+        copy_btn = box.addButton("复制详细信息", QMessageBox.ActionRole)
+        log_btn = box.addButton("打开日志目录", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is copy_btn:
+            QApplication.clipboard().setText(details)
+        elif clicked is log_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_log_path().parent)))
 
     def _finish_pipeline(self) -> None:
         """三种终态（成功/取消/失败）的统一收尾：回收线程并恢复按钮状态。"""
