@@ -96,11 +96,29 @@ def _drop_binary(dest):
         return keep is not None and name not in keep
     return d.startswith("PIL/_avif.")      # Pillow AVIF 扩展
 
+# ---------------------------------------------------------------- 应用资源
+# 窗口图标：既要作为 exe 图标（EXE(icon=...)），也要打进包内供运行时读取
+# （PyInstaller datas 的第二项是目标目录，因此最终落在 resources/app.ico）。
+_APP_RESOURCES = ("resources/app.ico",)
+
+
+def _app_datas():
+    """应用自带资源的 datas；缺文件直接报错，避免打出没有图标的包。"""
+    entries = []
+    for rel in _APP_RESOURCES:
+        src = Path(rel)
+        if not src.is_file():
+            raise SystemExit(f"[spec] 缺少资源文件: {rel}（窗口图标需要它）")
+        entries.append((rel, str(src.parent).replace("\\", "/")))
+    print(f"[spec] 应用资源: 打包 {len(entries)} 个文件")
+    return entries
+
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=_waifu2x_datas(),
+    datas=_waifu2x_datas() + _app_datas(),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -138,6 +156,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="resources/app.ico",       # exe 图标（窗口图标另由 resource_paths 在运行时读取）
 )
 
 coll = COLLECT(

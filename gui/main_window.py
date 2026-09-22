@@ -1,11 +1,21 @@
+"""主窗口：EPUB 处理队列、顺序执行与进度/结果展示。
+
+界面只负责「收集 → 展示 → 转发」：
+  - 选择（多选 / 拖放）EPUB 后入队，不立即开始；
+  - 队列模型与顺序调度在 gui/task_queue.py（纯 Python，可独立测试）；
+  - 一次只创建一个 PipelineWorker，上一本结束（成功 / 失败 / 取消）后才创建下一个，
+    因此不会同时启动多组 waifu2x 进程，也不会复用已结束的 QThread。
+"""
+
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from config_schema import DEFAULT_CONFIG, GPU_GUI_OPTIONS, NOISE_OPTIONS, SCALE_OPTIONS
@@ -13,7 +23,11 @@ from diagnostics import check_waifu2x_tool
 from epub.builder import build_epub
 from epub.reader import extract_images
 from errors import classify_error, format_details
+from gui.task_queue import (
+    REJECT_LABELS, STATUS_CANCELLED, STATUS_FAILED, QueueController,
+)
 from logging_setup import get_logger, get_log_path
+from resource_paths import app_icon_path
 from upscaler.compressor import compress_folder, quality_target
 from upscaler.waifu2x import upscale_folder
 from workspace import TaskWorkspace
@@ -34,6 +48,20 @@ GPU_LABELS = {
     1: "GPU 1",
     2: "GPU 2",
 }
+
+
+def load_app_icon():
+    """从 resources/app.ico 载入窗口图标（QIcon）。
+
+    路径由 resource_paths 解析：源码运行取项目根目录，PyInstaller onefile/onedir
+    取运行时的资源目录，因此不依赖当前工作目录。图标缺失（或 Qt 无法解码 ICO）
+    时返回空 QIcon，窗口使用系统默认图标，绝不抛异常。
+    """
+    path = app_icon_path()
+    if not path.is_file():
+        logger.warning("未找到窗口图标: %s", path)
+        return QIcon()
+    return QIcon(str(path))
 
 
 class PipelineWorker(QThread):
@@ -61,6 +89,9 @@ class PipelineWorker(QThread):
         self._gpu = gpu
         self._output_dir = output_dir
         self._is_cancelled = False
+        # 最近一次 run() 里失败（含原样保留）的图片数；信号语义保持不变，
+        # 上层据此区分「完全成功」与「完成但有部分图片失败」。
+        self.failure_count = 0
 
     def cancel(self) -> None:
         """请求取消：只设置标志位，真正的退出由子线程在检查点完成。"""
@@ -132,6 +163,7 @@ class PipelineWorker(QThread):
             total_failed = up_failed + compressed_failed
             summary = (f"超分 {upscaled} 张，跳过 {skipped} 张，"
                        f"原样复制 {copied} 张，失败 {total_failed} 张")
+            self.failure_count = total_failed
         except InterruptedError:
             self.cancelled.emit(cache_path)
             return
@@ -229,26 +261,75 @@ class SettingsDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    """主窗口：选好 EPUB 后一键跑完整条流水线，运行期间可随时取消。"""
+    """主窗口：把多个 EPUB 加入队列，按顺序一本一本地跑完整条流水线。
+
+    界面只负责「收集 → 展示 → 转发」：
+      - 选择（多选 / 拖放）EPUB 后只入队，不立即开始；
+      - 队列模型与顺序调度放在 gui/task_queue.py（纯 Python，可独立测试）；
+      - 一次只创建一个 PipelineWorker，上一本结束（成功 / 失败 / 取消）后才创建
+        下一个，所以不会同时启动多组 waifu2x 进程，也不会复用已结束的 QThread。
+    """
 
     def __init__(self, config=None, save_config_callback=None,
                  default_output_dir=None) -> None:
         super().__init__()
         self.setWindowTitle("MangaUpscaler")
+        self.setWindowIcon(load_app_icon())     # 窗口/任务栏图标（resources/app.ico）
         # config 由 main.py 注入（已带默认值兜底）；保存/默认输出目录回调也由入口注入
         self.config = dict(config) if config else dict(DEFAULT_CONFIG)
         self._save_config = save_config_callback or (lambda _config: None)
         self._get_default_output_dir = default_output_dir or (lambda: "output")
         self.selected_epub_path = None
-        self.pipeline_worker = None
+        self._closing = False
+        self._cancel_requested = False     # 已请求「取消当前」，按钮保持禁用
+        self._last_error_details = ""
+        self.controller = QueueController(
+            worker_factory=self._create_worker,
+            dispose_worker=self._dispose_worker,
+            on_changed=self._on_queue_changed,
+            on_finished=self._on_queue_finished,
+        )
 
+        self._build_ui()
+        self.setAcceptDrops(True)          # 支持把一个或多个 EPUB 拖进窗口
+        self._on_queue_changed()
+
+    def _build_ui(self) -> None:
+        """搭建界面：队列列表 + 队列操作 + 原有输出目录/设置/进度区。"""
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-
         layout = QVBoxLayout(central_widget)
-        self.select_button = QPushButton("选择 EPUB")
-        self.select_button.clicked.connect(self._on_select_epub)
-        layout.addWidget(self.select_button)
+
+        # 队列操作行
+        queue_row = QHBoxLayout()
+        self.add_button = QPushButton("添加 EPUB")
+        self.add_button.clicked.connect(self._on_add_epubs)
+        queue_row.addWidget(self.add_button)
+        self.remove_button = QPushButton("删除选中")
+        self.remove_button.clicked.connect(self._on_remove_selected)
+        queue_row.addWidget(self.remove_button)
+        self.clear_button = QPushButton("清空队列")
+        self.clear_button.clicked.connect(self._on_clear_queue)
+        queue_row.addWidget(self.clear_button)
+        queue_row.addStretch(1)
+        layout.addLayout(queue_row)
+
+        # 待处理列表：文件名 / 状态 / 输出路径或错误摘要
+        self.queue_table = QTableWidget(0, 3)
+        self.queue_table.setHorizontalHeaderLabels(["文件", "状态", "输出 / 错误"])
+        self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.queue_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.queue_table.verticalHeader().setVisible(False)
+        header = self.queue_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        layout.addWidget(self.queue_table, 1)
+
+        # 队列状态：第 x/n 本 + 已完成/失败/待处理本数
+        self.queue_label = QLabel("队列为空")
+        layout.addWidget(self.queue_label)
 
         # 输出路径行：标签 + 可编辑输入框 + 浏览按钮
         output_row = QHBoxLayout()
@@ -263,11 +344,19 @@ class MainWindow(QMainWindow):
         output_row.addWidget(self.browse_button)
         layout.addLayout(output_row)
 
-        # 取消按钮：平时隐藏，只在流水线运行期间出现
-        self.cancel_button = QPushButton("取消")
-        self.cancel_button.clicked.connect(self._on_cancel_clicked)
-        self.cancel_button.setVisible(False)
-        layout.addWidget(self.cancel_button)
+        # 队列控制行：一次只跑一本；取消当前不会自动开始下一本
+        action_row = QHBoxLayout()
+        self.start_button = QPushButton("开始处理")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        action_row.addWidget(self.start_button)
+        self.cancel_current_button = QPushButton("取消当前")
+        self.cancel_current_button.clicked.connect(self._on_cancel_current_clicked)
+        action_row.addWidget(self.cancel_current_button)
+        self.cancel_queue_button = QPushButton("取消队列")
+        self.cancel_queue_button.clicked.connect(self._on_cancel_queue_clicked)
+        action_row.addWidget(self.cancel_queue_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
 
         # 状态标签：次要样式（灰色小字），放在进度条上方，用来说明"正在处理什么"
         self.status_label = QLabel("")
@@ -323,116 +412,345 @@ class MainWindow(QMainWindow):
         )
         return False
 
-    def _on_select_epub(self) -> None:
-        """选好文件后立即启动流水线，无需再点第二次。"""
-        if self.pipeline_worker is not None and self.pipeline_worker.isRunning():
+    # --- 添加 / 删除 EPUB ---------------------------------------------------
+    def _on_add_epubs(self) -> None:
+        """多选 EPUB：只加入队列，不立即开始处理。"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择 EPUB 文件", "", "EPUB 文件 (*.epub)"
+        )
+        if not file_paths:
+            return
+        self._enqueue_paths(file_paths)
+
+    def _enqueue_paths(self, paths) -> None:
+        """过滤后入队，并把被拒绝的文件原因一次性告诉用户。"""
+        added, rejected = self.controller.add(paths)
+        if added:
+            self.selected_epub_path = added[0].epub_path
+            logger.info("已加入队列: %s", [item.epub_path for item in added])
+        if rejected:
+            lines = ["%s（%s）" % (Path(path).name, REJECT_LABELS.get(reason, reason))
+                     for path, reason in rejected]
+            QMessageBox.information(
+                self, "部分文件未加入队列",
+                "以下文件被跳过：\n" + "\n".join(lines)
+            )
+
+    def dragEnterEvent(self, event) -> None:
+        """拖放进入：只接受至少包含一个 .epub 的拖放。"""
+        if self._dropped_epubs(event) and not self.controller.is_running:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        """拖放落下：把所有 .epub 加入队列（过滤交给队列模型统一处理）。"""
+        paths = self._dropped_epubs(event)
+        if paths:
+            event.acceptProposedAction()
+            self._enqueue_paths(paths)
+
+    @staticmethod
+    def _dropped_epubs(event):
+        """从拖放数据里挑出 .epub 路径（其余交给队列模型报「不是 EPUB 文件」）。"""
+        if not event.mimeData().hasUrls():
+            return []
+        return [url.toLocalFile() for url in event.mimeData().urls()
+                if url.isLocalFile() and url.toLocalFile().lower().endswith(".epub")]
+
+    def _selected_paths(self):
+        """列表里选中项目对应的 EPUB 路径（表格行序与队列顺序一致）。"""
+        items = self.controller.items
+        return [items[row].epub_path for row in sorted(self._selected_rows())
+                if 0 <= row < len(items)]
+
+    def _selected_rows(self):
+        return {index.row() for index in self.queue_table.selectionModel().selectedRows()}
+
+    def _on_remove_selected(self) -> None:
+        """删除选中的项目；正在处理的项目会被模型拒绝（不会被删掉）。"""
+        paths = self._selected_paths()
+        if not paths:
+            return
+        removed, refused = self.controller.remove_all(paths)
+        if refused:
+            QMessageBox.information(
+                self, "无法删除",
+                "正在处理的项目不能删除，其余项目已删除。"
+            )
+        logger.info("已从队列删除 %d 项", removed)
+
+    def _on_clear_queue(self) -> None:
+        """清空队列：空闲时清掉全部项目；运行中只清掉「待处理」项目。
+
+        清空后统一刷新界面（表格 / 状态标签 / 进度 / 按钮），并清掉选中状态，
+        避免选中行指向已被删除的项目。没有任何可清除项目时给出明确提示，
+        不静默表现得像按钮坏了。只动队列数据，绝不删除输入 EPUB 或输出文件。
+        """
+        if self.controller.clearable_count() <= 0:
+            self._show_nothing_to_clear()
+            return
+        cleared = self.controller.clear()
+        if not cleared:
+            self._show_nothing_to_clear()
+            return
+        logger.info("已从队列清除 %d 个项目（运行中只清待处理）", cleared)
+        self.queue_table.clearSelection()      # 清空选中状态
+        self._refresh_queue_table()
+        self._update_queue_summary()
+        self._update_progress()
+        self._update_button_states()
+
+    def _show_nothing_to_clear(self) -> None:
+        """没有可清除项目时的明确反馈，并同步一次按钮状态。"""
+        self._update_button_states()
+        QMessageBox.information(self, "提示", "没有可清除的任务。")
+
+    # --- 开始 / 取消 -------------------------------------------------------
+    def _on_start_clicked(self) -> None:
+        """开始顺序处理队列；运行期间重复点击无效。"""
+        if self.controller.is_running:
             return
         if not self._check_can_process():
             return
+        self._persist_output_dir()
+        if not self.controller.start():
+            QMessageBox.information(self, "提示", "队列里没有待处理的项目。")
 
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择 EPUB 文件", "", "EPUB 文件 (*.epub)"
-        )
-        if not file_path:
+    def _on_cancel_current_clicked(self) -> None:
+        """只取消当前正在处理的那一本；不再自动开始下一本。"""
+        if not self.controller.cancel_current():
             return
-        self.selected_epub_path = file_path
-        logger.info("已选择文件: %s", file_path)
+        self._cancel_requested = True                  # 防重复点击
+        self.cancel_current_button.setEnabled(False)
+        logger.info("已请求取消当前项目")
 
-        # 输出目录：以输入框为准，空则回退默认；手动编辑的值也一并落盘
+    def _on_cancel_queue_clicked(self) -> None:
+        """取消整队：先取消当前任务，剩余待处理项目标记为未处理。"""
+        skipped = self.controller.cancel_all()
+        logger.info("已请求取消整个队列，剩余 %d 项标记为未处理", skipped)
+
+    def _persist_output_dir(self) -> str:
+        """以输入框为准确定输出目录，变化时落盘（沿用原有行为）。"""
         output_dir = self.output_dir_edit.text().strip() or self._get_default_output_dir()
         self.output_dir_edit.setText(output_dir)
         if output_dir != self.config.get("output_dir"):
             self.config["output_dir"] = output_dir
             self._save_config(self.config)
+        return output_dir
 
-        self.progress_bar.setRange(0, 0)   # 提取阶段还没有总数，先显示忙碌动画
-        self.progress_bar.setVisible(True)
-        self.status_label.setText("正在提取图片...")
-        self.status_label.setVisible(True)
-        self._set_running(True)
-
-        self.pipeline_worker = PipelineWorker(
-            file_path, scale=self.config["scale"], noise=self.config["noise"],
+    # --- worker 生命周期 ---------------------------------------------------
+    def _create_worker(self, item):
+        """为队列项目创建新的 PipelineWorker（绝不复用已结束的 worker）。"""
+        logger.info("开始处理 (%s): %s", item.name, item.epub_path)
+        self._cancel_requested = False     # 新的一本开始，「取消当前」重新可用
+        worker = PipelineWorker(
+            item.epub_path, scale=self.config["scale"], noise=self.config["noise"],
             quality=self.config["quality"], gpu=self.config.get("gpu", "auto"),
-            output_dir=output_dir,
+            output_dir=self._persist_output_dir(),
         )
-        self.pipeline_worker.progress.connect(self._on_pipeline_progress)
-        self.pipeline_worker.succeeded.connect(self._on_pipeline_succeeded)
-        self.pipeline_worker.cancelled.connect(self._on_pipeline_cancelled)
-        self.pipeline_worker.failed.connect(self._on_pipeline_failed)
-        self.pipeline_worker.start()
+        worker.progress.connect(self._on_worker_progress)
+        worker.succeeded.connect(self._on_worker_succeeded)
+        worker.cancelled.connect(self._on_worker_cancelled)
+        worker.failed.connect(self._on_worker_failed)
+        return worker
 
-    def _on_cancel_clicked(self) -> None:
-        """请求取消：立即禁用按钮防重复点击，真正的退出由子线程完成。"""
-        worker = self.pipeline_worker
-        if worker is not None and worker.isRunning():
-            self.cancel_button.setEnabled(False)
-            worker.cancel()
+    def _dispose_worker(self, worker) -> None:
+        """等子线程真正结束后再回收（不留后台线程，也就不会残留 waifu2x 子进程）。"""
+        worker.wait()
+        worker.deleteLater()
 
-    def _on_pipeline_progress(self, text: str, done: int, total: int) -> None:
-        self.status_label.setText(text)
-        self.status_label.setVisible(True)
-        if total > 0:
-            self.progress_bar.setRange(0, total)   # 每个阶段开始时重新设定上限
-            self.progress_bar.setValue(done)
+    # --- 单本进度与终态（转发布到队列控制器） ------------------------------
+    def _on_worker_progress(self, text: str, done: int, total: int) -> None:
+        self.controller.on_progress(text, done, total)
+
+    def _on_worker_succeeded(self, output_path: str, summary: str) -> None:
+        worker = self.controller.running_worker
+        failed_images = getattr(worker, "failure_count", 0)
+        self.controller.on_succeeded(output_path, summary, failed_images)
+
+    def _on_worker_cancelled(self, cache_path: str) -> None:
+        self.controller.on_cancelled(cache_path)
+
+    def _on_worker_failed(self, message: str, suggestion: str, details: str) -> None:
+        self.controller.on_failed(message, suggestion, details)
+
+
+    # --- 队列视图刷新 ------------------------------------------------------
+    def _on_queue_changed(self) -> None:
+        """队列或当前进度有变化：统一刷新列表、标签、进度与按钮状态。"""
+        self._refresh_queue_table()
+        self._update_queue_summary()
+        self._update_progress()
+        self._update_button_states()
+
+    def _refresh_queue_table(self) -> None:
+        """重建列表行：文件名 / 状态 / 输出路径或错误摘要。"""
+        items = self.controller.items
+        self.queue_table.setRowCount(len(items))
+        for row, item in enumerate(items):
+            values = (item.name, item.status_label, item.display_detail)
+            for column, value in enumerate(values):
+                cell = self.queue_table.item(row, column)
+                if cell is None:
+                    cell = QTableWidgetItem()
+                    self.queue_table.setItem(row, column, cell)
+                cell.setText(value)
+
+    def _update_queue_summary(self) -> None:
+        """显示「正在处理第 x/n 本」与已完成/失败/取消/待处理本数。"""
+        counts = self.controller.counts()
+        done, total = self.controller.current_position()
+        parts = []
+        if self.controller.is_running and total:
+            parts.append("正在处理第 %d/%d 本：%s" % (done, total,
+                                                    self.controller.running_item.name))
+        elif total:
+            parts.append("队列共 %d 本" % total)
         else:
-            self.progress_bar.setRange(0, 0)       # 不确定进度：显示忙碌动画
+            parts.append("队列为空")
+        succeeded = self.controller.queue.succeeded_count()
+        parts.append("已完成 %d 本" % succeeded)
+        parts.append("失败 %d 本" % counts[STATUS_FAILED])
+        parts.append("取消 %d 本" % counts[STATUS_CANCELLED])
+        parts.append("待处理 %d 本" % self.controller.queue.unprocessed_count())
+        self.queue_label.setText("　".join(parts))
+
+    def _update_progress(self) -> None:
+        """当前这一本的进度：始终使用真实的 done/total；没有总数时用不确定进度。
+
+        队列级进度只按「书籍完成数」表达（见 _update_queue_summary），
+        不伪造总体百分比；队列为空或空闲时隐藏并重置进度条。
+        """
+        item = self.controller.running_item
+        if item is None:
+            self.status_label.setText("")
+            self.status_label.setVisible(False)
+            self.progress_bar.setVisible(False)
+            self.progress_bar.reset()
+            return
+        self.status_label.setText(item.progress_text or "正在准备...")
+        self.status_label.setVisible(True)
         self.progress_bar.setVisible(True)
+        if item.progress_total > 0:
+            self.progress_bar.setRange(0, item.progress_total)
+            self.progress_bar.setValue(item.progress_done)
+        else:
+            self.progress_bar.setRange(0, 0)      # 总数未知：不确定进度
 
-    def _on_pipeline_succeeded(self, output_path: str, summary: str) -> None:
-        self._finish_pipeline()
-        QMessageBox.information(
-            self, "完成",
-            f"新 EPUB 已生成：\n{output_path}\n\n处理统计：{summary}"
-        )
 
-    def _on_pipeline_cancelled(self, cache_path: str) -> None:
-        self._finish_pipeline()
-        msg = "处理已取消。"
-        if cache_path:
-            msg += f"\n临时缓存已保留，可用于排错：\n{cache_path}"
-        QMessageBox.information(self, "提示", msg)
-
-    def _on_pipeline_failed(self, message: str, suggestion: str, details: str) -> None:
-        self._finish_pipeline()
-        self._show_error_dialog(message, suggestion, details)
-
-    def _show_error_dialog(self, message: str, suggestion: str, details: str) -> None:
-        """错误弹窗：正文简短易懂；提供「复制详细信息」「打开日志目录」。"""
+    # --- 整队结束后的汇总与收尾操作 -----------------------------------------
+    def _on_queue_finished(self, summary: str) -> None:
+        """整队结束：显示汇总，并提供打开输出/复制错误/查看日志等操作。"""
+        self._cancel_requested = False
+        self._update_button_states(running=False)
+        failed = [item for item in self.controller.items
+                  if item.status == STATUS_FAILED]
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Critical)
-        box.setWindowTitle("错误")
-        box.setText(message)
-        if suggestion:
-            box.setInformativeText(suggestion)
-        copy_btn = box.addButton("复制详细信息", QMessageBox.ActionRole)
-        log_btn = box.addButton("打开日志目录", QMessageBox.ActionRole)
+        box.setIcon(QMessageBox.Warning if failed else QMessageBox.Information)
+        box.setWindowTitle("队列处理完成")
+        box.setText(summary)
+        if failed:
+            box.setInformativeText("失败：%s" % "、".join(item.name for item in failed))
+        open_dir_btn = box.addButton("打开输出目录", QMessageBox.ActionRole)
+        open_file_btn = box.addButton("打开选中项目的输出文件", QMessageBox.ActionRole)
+        copy_btn = box.addButton("复制错误详情", QMessageBox.ActionRole)
+        log_btn = box.addButton("查看日志目录", QMessageBox.ActionRole)
         box.addButton("关闭", QMessageBox.RejectRole)
         box.exec()
+
         clicked = box.clickedButton()
-        if clicked is copy_btn:
-            QApplication.clipboard().setText(details)
+        if clicked is open_dir_btn:
+            self._open_output_dir()
+        elif clicked is open_file_btn:
+            self._open_selected_output()
+        elif clicked is copy_btn:
+            self._copy_error_details()
         elif clicked is log_btn:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_log_path().parent)))
+            self._open_log_dir()
 
-    def _finish_pipeline(self) -> None:
-        """三种终态（成功/取消/失败）的统一收尾：回收线程并恢复按钮状态。"""
-        self._release_pipeline_worker()
-        self._set_running(False)
-        self.progress_bar.setVisible(False)
-        self.progress_bar.reset()
-        self.status_label.setVisible(False)
+        if self._closing:
+            # 用户确认过「取消并退出」：worker 已真正结束，现在才真正关闭窗口
+            self.close()
 
-    def _release_pipeline_worker(self) -> None:
-        """等子线程真正结束后再回收 worker 对象。"""
-        worker = self.pipeline_worker
-        self.pipeline_worker = None
-        if worker is not None:
-            worker.wait()
-            worker.deleteLater()
+    def _open_output_dir(self) -> None:
+        """打开当前设置的输出目录。"""
+        output_dir = Path(self._persist_output_dir())
+        if not output_dir.exists():
+            QMessageBox.information(self, "提示", "输出目录还不存在：\n%s" % output_dir)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_dir)))
 
-    def _set_running(self, running: bool) -> None:
-        """运行期间禁用"选择 EPUB"并显示"取消"；结束后反过来。"""
-        self.select_button.setEnabled(not running)
-        self.cancel_button.setVisible(running)
-        self.cancel_button.setEnabled(True)   # 每次进入运行态都重新可用
+    def _open_selected_output(self) -> None:
+        """打开选中项目的输出 EPUB（没有输出时给出提示）。"""
+        paths = self._selected_paths()
+        for item in self.controller.items:
+            if paths and item.epub_path == paths[0] and item.output_path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(item.output_path))
+                return
+        QMessageBox.information(self, "提示", "选中的项目还没有生成输出文件。")
+
+    def _copy_error_details(self) -> None:
+        """把失败项目的详细错误复制到剪贴板。"""
+        details = [item.details or item.error for item in self.controller.items
+                   if item.status == STATUS_FAILED and (item.details or item.error)]
+        if not details and self._last_error_details:
+            details = [self._last_error_details]
+        if not details:
+            QMessageBox.information(self, "提示", "没有可复制的错误详情。")
+            return
+        QApplication.clipboard().setText("\n\n".join(details))
+        logger.info("错误详情已复制到剪贴板")
+
+    def _open_log_dir(self) -> None:
+        """打开日志目录（沿用原有行为）。"""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_log_path().parent)))
+
+    # --- 运行状态与窗口关闭 -------------------------------------------------
+    def _update_button_states(self, running=None) -> None:
+        """按「队列实际状态」统一计算所有按钮的启用/禁用。
+
+        - 运行中禁掉会影响当前任务的设置（添加 / 设置 / 浏览 / 输出目录）；
+        - 「开始处理」只在空闲且确实有「待处理」项目时可用（清空队列后自动变灰）；
+        - 「清空队列」按「是否存在可清除项目」计算，不因为处于运行状态就无条件禁用
+          （运行中只要有待处理项目就仍然可以清除它们）。
+        """
+        running = self.controller.is_running if running is None else running
+        for widget in (self.add_button, self.settings_button, self.browse_button):
+            widget.setEnabled(not running)
+        self.output_dir_edit.setEnabled(not running)
+        self.start_button.setEnabled(
+            not running and self.controller.queue.pending_count() > 0)
+        self.clear_button.setEnabled(self.controller.clearable_count() > 0)
+        self.remove_button.setEnabled(self.controller.queue.removable_count() > 0)
+        self.cancel_current_button.setEnabled(running and not self._cancel_requested)
+        self.cancel_queue_button.setEnabled(running or bool(self.controller.items))
+
+    def closeEvent(self, event) -> None:
+        """关窗：没有任务直接关；有任务时询问是否取消并退出。
+
+        用户确认取消后不会阻塞在这里等：先请求取消整队，等 PipelineWorker 真正
+        结束（子进程被终止、线程回收）后再由 _on_queue_finished 关闭窗口，
+        因此不会遗留 waifu2x 子进程，也不会留下写了一半的输出。
+        """
+        action = self.controller.request_close()
+        if action == "close":
+            event.accept()
+            return
+        if action == "wait":
+            event.ignore()          # 已在取消过程中，等 worker 结束
+            return
+
+        reply = QMessageBox.question(
+            self, "任务正在运行",
+            "队列还在处理，是否取消当前任务并退出？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.controller.decline_close()
+            event.ignore()
+            return
+        logger.info("用户选择取消并退出，等待 worker 结束")
+        self._closing = True
+        self.controller.close_confirmed()
+        event.ignore()
+
