@@ -23,16 +23,24 @@ class GpuArgsTest(unittest.TestCase):
         self.assertEqual(gpu_args(42), ["-g", "42"])
 
 
+def _fake_popen(returncode=0, stdout="", stderr=""):
+    """最小 Popen 替身：communicate() 直接返回结果，不真正启动子进程。"""
+    proc = mock.Mock()
+    proc.returncode = returncode
+    proc.communicate.return_value = (stdout, stderr)
+    return proc
+
+
 class UpscaleImageCommandTest(unittest.TestCase):
-    """upscale_image 的命令行构造（subprocess.run 全部 mock，不真正执行）。"""
+    """upscale_image 的命令行构造（subprocess.Popen 全部 mock，不真正执行）。"""
 
     def _run_command(self, gpu):
         with mock.patch("upscaler.waifu2x.WAIFU2X_EXE") as exe, \
-             mock.patch("upscaler.waifu2x.subprocess.run") as run:
+             mock.patch("upscaler.waifu2x.subprocess.Popen",
+                        return_value=_fake_popen()) as popen:
             exe.exists.return_value = True
-            run.return_value = mock.Mock(returncode=0, stderr="")
             upscale_image("in.png", "out.png", scale=2, noise=3, gpu=gpu)
-            return run.call_args[0][0]
+            return popen.call_args[0][0]
 
     def test_auto_omits_g_flag(self):
         cmd = self._run_command("auto")
