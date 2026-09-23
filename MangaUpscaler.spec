@@ -76,7 +76,9 @@ def _waifu2x_datas():
     missing = [str(p) for p in required if not p.is_file()]
     if missing:
         raise SystemExit(f"[spec] 缺少必需文件: {missing}")
-    print(f"[spec] tools: 打包 {len(entries)} 个文件，裁剪 {pruned} 个")
+    # 控制台输出必须是纯 ASCII：Windows CI（GitHub Actions Runner）的 stdout 是
+    # cp1252，非 ASCII 字符会让 print() 抛 UnicodeEncodeError 直接打断打包/测试。
+    print(f"[spec] tools: bundled {len(entries)} files, pruned {pruned}")
     return entries
 
 
@@ -110,7 +112,6 @@ def _app_datas():
         if not src.is_file():
             raise SystemExit(f"[spec] 缺少资源文件: {rel}（窗口图标需要它）")
         entries.append((rel, str(src.parent).replace("\\", "/")))
-    print(f"[spec] 应用资源: 打包 {len(entries)} 个文件")
     return entries
 
 
@@ -129,13 +130,13 @@ a = Analysis(
 
 # ---- 裁剪：必须在 Analysis 之后、COLLECT 之前 ----
 if FULL_PACKAGE:
-    print("[spec] FULL_PACKAGE=1：跳过 TOC 裁剪")
+    print("[spec] FULL_PACKAGE=1: skipping TOC pruning")
 else:
     _nb, _nd = len(a.binaries), len(a.datas)
     a.binaries = [b for b in a.binaries if not _drop_binary(b[0])]
     a.datas = [d for d in a.datas
                if not d[0].replace("\\", "/").startswith("PySide6/translations/")]
-    print(f"[spec] 裁剪 binaries {_nb} -> {len(a.binaries)}，"
+    print(f"[spec] pruned binaries {_nb} -> {len(a.binaries)}, "
           f"datas {_nd} -> {len(a.datas)}")
 
 pyz = PYZ(a.pure)

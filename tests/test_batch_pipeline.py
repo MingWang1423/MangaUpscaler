@@ -12,6 +12,7 @@
   - 进度只回调一次且推进到 total；四元组统计保持兼容。
 """
 
+import os
 import tempfile
 import threading
 import time
@@ -121,7 +122,11 @@ class PlannerIntegrationTest(BatchPipelineTestBase):
         self.assertEqual(result, (1, 0, 0, 0))
         process = recorder.processes[0]
         batch_dir = process.input_dir.parent
-        self.assertEqual(batch_dir.parent, self.root)          # <workspace>/batch_xx
+        # 同一目录在 Windows 上可能表现为长路径（_batch_root_for 的 resolve()）或
+        # 8.3 短路径（RUNNER~1），字符串比较会误判；用 samefile 按文件系统对象
+        # 比较，语义仍是「批次临时目录建在当前任务工作目录下」。
+        self.assertTrue(os.path.samefile(batch_dir.parent, self.root),
+                        f"{batch_dir.parent} 不在任务工作目录 {self.root} 下")
         self.assertEqual(process.input_dir.name, "input")
         self.assertEqual(process.output_dir.name, "output")
         self.assertTrue(process.input_dir.is_absolute())
